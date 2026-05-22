@@ -254,6 +254,16 @@ def main():
     fpre_files = sorted(glob.glob(os.path.join(args.data_dir, "fpre_*.npy")))
 
     if len(fpre_files) == 0:
+        # The animation runs a self-contained NN-driven LBM simulation and does
+        # not need the recorded fpre/fpost snapshots. So when there is no eval
+        # data, only fail if the user actually asked for evaluation.
+        if args.animate:
+            print(
+                f"\nNo fpre_*.npy files found in '{args.data_dir}'; "
+                "skipping evaluation and running animation only."
+            )
+            make_animation(model, args)
+            return
         raise FileNotFoundError(
             f"No fpre_*.npy files found in '{args.data_dir}'.\n"
             "Run lbm_karman-ng.py with --save-every > 0 first."
