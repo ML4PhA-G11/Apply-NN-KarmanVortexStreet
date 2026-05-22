@@ -17,17 +17,18 @@ The script expects pairs of files named:
 import os
 import glob
 import argparse
+from typing import cast
 import numpy as np
 import matplotlib
+from matplotlib.artist import Artist
 from tqdm import tqdm
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 
-import tensorflow as tf
 import keras
-from keras import backend as K
+from keras import Model, backend as K
 from numba import njit
 from utils import D4Symmetry, AlgReconstruction, D4AntiSymmetry
 
@@ -54,8 +55,12 @@ def equilibrium(rho, ux, uy):
 
 def rmsre(y_true, y_pred):
     """Root Mean Squared Relative Error — same loss used during training."""
-    return keras.backend.sqrt(
-        keras.backend.mean(keras.backend.square((y_true - y_pred) / (y_true + keras.backend.epsilon())))
+    return keras.backend.sqrt(  # pyright: ignore[reportAttributeAccessIssue]
+        keras.backend.mean(  # pyright: ignore[reportAttributeAccessIssue]
+            keras.backend.square(  # pyright: ignore[reportAttributeAccessIssue]
+                (y_true - y_pred) / (y_true + keras.backend.epsilon())
+            )
+        )
     )
 
 
@@ -98,7 +103,7 @@ def parse_args():
         "--animate", action="store_true", default=False, help="Produce a GIF of the NN-predicted velocity field"
     )
     p.add_argument("--gif-fps", type=int, default=5, help="Frames per second for the GIF animation")
-    p.add_argument("--update-steps", type=int, default=25, help="Update the GIF every N simulation steps")
+    p.add_argument("--update-steps", type=int, default=100, help="Update the GIF every N simulation steps")
     p.add_argument(
         "--anim-steps", type=int, default=5000, help="Total number of simulation steps to run for the animation"
     )
@@ -169,7 +174,7 @@ def make_animation(model, args):
         fpre = f.reshape(-1, 9)
         norm = np.sum(fpre, axis=1, keepdims=True)
         fpre_norm = fpre / norm
-        f_out_norm = model.predict(fpre_norm, batch_size=args.batch_size, verbose=0)
+        f_out_norm = model.predict(fpre_norm, batch_size=args.batch_size, verbose=cast(str, 0))
         f_out = (f_out_norm * norm).reshape(Nx, Ny, 9)
 
         # -- Bounce-back on obstacle --
@@ -225,11 +230,19 @@ def make_animation(model, args):
 
     fig, ax = plt.subplots(figsize=(10, 4), dpi=100)
 
-    def update(i):
+    def update(i: int) -> list[Artist]:
         ax.cla()
         speed = np.sqrt(frames_ux[i] ** 2 + frames_uy[i] ** 2)
         speed[obstacle] = np.nan
-        ax.imshow(speed.T, origin="lower", cmap="jet", vmin=0, vmax=U_max, aspect="auto", extent=[0, Nx, 0, Ny])
+        ax.imshow(
+            speed.T,
+            origin="lower",
+            cmap="jet",
+            vmin=0,
+            vmax=U_max,
+            aspect="auto",
+            extent=(0, Nx, 0, Ny),
+        )
         ux_i = frames_ux[i].copy()
         ux_i[obstacle] = 0.0
         uy_i = frames_uy[i].copy()
@@ -238,6 +251,7 @@ def make_animation(model, args):
         ax.set_title(f"NN predicted velocity — step {frame_steps[i]}", fontsize=12)
         ax.set_xlabel("x")
         ax.set_ylabel("y")
+        return []
 
     anim = FuncAnimation(fig, update, frames=len(frames_ux), interval=1000 // args.gif_fps)
     gif_path = os.path.join(args.out_dir, "nn_velocity_field.gif")
@@ -258,14 +272,17 @@ def main():
     # ── 1. Load model ──────────────────────────────────────────────────────
     K.set_floatx("float64")
     print(f"Loading model from: {args.model_path}")
-    model = keras.models.load_model(
-        args.model_path,
-        custom_objects={
-            "rmsre": rmsre,
-            "D4Symmetry": D4Symmetry,
-            "AlgReconstruction": AlgReconstruction,
-            "D4AntiSymmetry": D4AntiSymmetry,
-        },
+    model = cast(
+        Model,
+        keras.models.load_model(
+            args.model_path,
+            custom_objects={
+                "rmsre": rmsre,
+                "D4Symmetry": D4Symmetry,
+                "AlgReconstruction": AlgReconstruction,
+                "D4AntiSymmetry": D4AntiSymmetry,
+            },
+        ),
     )
     model.summary()
 
@@ -320,7 +337,7 @@ def main():
         fpost_norm, _ = normalize(fpost_flat)
 
         # NN prediction
-        fpost_pred_norm = model.predict(fpre_norm, batch_size=args.batch_size, verbose=0)
+        fpost_pred_norm = model.predict(fpre_norm, batch_size=args.batch_size, verbose=cast(str, 0))
 
         # ── Per-snapshot metrics ───────────────────────────────────────────
         eps = 1e-15
@@ -392,7 +409,7 @@ def main():
         fpre_norm, _ = normalize(fpre_raw.reshape(-1, Q))
         fpost_norm, _ = normalize(fpost_raw.reshape(-1, Q))
 
-        fpost_pred = model.predict(fpre_norm, batch_size=args.batch_size, verbose=0)
+        fpost_pred = model.predict(fpre_norm, batch_size=args.batch_size, verbose=cast(str, 0))
 
         eps = 1e-15
         rel_err = np.abs((fpost_norm - fpost_pred) / (fpost_norm + eps))
