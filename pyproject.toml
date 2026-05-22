@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=2.2.6",
     "scikit-learn>=1.7.2",
     "tensorflow>=2.21.0",
+    "tqdm>=4.67.3",
 ]
 
 [dependency-groups]

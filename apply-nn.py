@@ -19,6 +19,7 @@ import glob
 import argparse
 import numpy as np
 import matplotlib
+from tqdm import tqdm
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -157,7 +158,7 @@ def make_animation(model, args):
     n_steps = args.anim_steps
     update_every = args.update_steps
 
-    for step in range(1, n_steps + 1):
+    for step in tqdm(range(1, n_steps + 1)):
 
         # -- Macroscopic quantities --
         rho = np.sum(f, axis=2)
@@ -293,7 +294,7 @@ def main():
     mae_scores = []
     max_err = []
 
-    for fpre_path in fpre_files:
+    for fpre_path in tqdm(fpre_files):
         # Derive matching fpost path
         fname = os.path.basename(fpre_path)
         step_str = fname.replace("fpre_", "").replace(".npy", "")
