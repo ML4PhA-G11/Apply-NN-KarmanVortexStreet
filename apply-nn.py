@@ -248,6 +248,8 @@ def make_animation(model, args):
         uy_i = frames_uy[i].copy()
         uy_i[obstacle] = 0.0
         ax.streamplot(X.T, Y.T, ux_i.T, uy_i.T, density=0.5, color="w", linewidth=0.6)
+        ax.set_xlim(0, Nx)
+        ax.set_ylim(0, Ny)
         ax.set_title(f"NN predicted velocity — step {frame_steps[i]}", fontsize=12)
         ax.set_xlabel("x")
         ax.set_ylabel("y")
