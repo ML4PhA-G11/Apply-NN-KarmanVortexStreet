@@ -30,11 +30,9 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 import keras
 from keras import Model, backend as K
 from numba import njit
-from utils import D4Symmetry, AlgReconstruction, D4AntiSymmetry
+from lbm_ml import LB_stencil, D4Symmetry, AlgReconstruction, D4AntiSymmetry, rmsre
 
-c = np.array([[0, 0], [1, 0], [0, 1], [-1, 0], [0, -1], [1, 1], [-1, 1], [-1, -1], [1, -1]])
-
-w = np.array([4 / 9, 1 / 9, 1 / 9, 1 / 9, 1 / 9, 1 / 36, 1 / 36, 1 / 36, 1 / 36])
+c, w, _cs2, _ = LB_stencil()
 
 
 @njit
@@ -51,17 +49,6 @@ def equilibrium(rho, ux, uy):
 # ──────────────────────────────────────────────
 # Helpers — must match training definitions
 # ──────────────────────────────────────────────
-
-
-def rmsre(y_true, y_pred):
-    """Root Mean Squared Relative Error — same loss used during training."""
-    return keras.backend.sqrt(  # pyright: ignore[reportAttributeAccessIssue]
-        keras.backend.mean(  # pyright: ignore[reportAttributeAccessIssue]
-            keras.backend.square(  # pyright: ignore[reportAttributeAccessIssue]
-                (y_true - y_pred) / (y_true + keras.backend.epsilon())
-            )
-        )
-    )
 
 
 def normalize(f):

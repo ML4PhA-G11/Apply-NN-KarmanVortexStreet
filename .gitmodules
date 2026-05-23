@@ -1,0 +1,3 @@
+[submodule "model-experiments"]
+	path = model-experiments
+	url = https://github.com/ML4PhA-G11/model-experiments
