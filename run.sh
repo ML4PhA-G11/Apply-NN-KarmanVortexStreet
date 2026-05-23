@@ -1,0 +1,1 @@
+uv run apply-nn.py --model-path ../../model-experiments/artifacts-run-all-tensorflow/resnet_karman_every_100_samp_334_bs32_ep3000_pat3000_lr1e-3/model.keras --data-dir ../../data/lbm-simulator-karman/every_100/ --update-steps 50 --anim-steps 6500 --animate --preview-path artifacts/resnet_karman_2000/eval_results/preview.png --out-dir artifacts/resnet_karman_2000/eval_results
