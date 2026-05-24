@@ -98,6 +98,19 @@ def parse_args():
                    help="Update the GIF every N simulation steps")
     p.add_argument( "--anim-steps", type=int, default=5000,
                     help="Total number of simulation steps to run for the animation")
+    p.add_argument("--taylor-green", action="store_true", default=False,
+                   help="Run a Taylor-Green decay simulation with the NN as the "
+                        "collision operator (skips Kármán fpre/fpost evaluation)")
+    p.add_argument("--tg-nx", type=int, default=32, help="Taylor-Green grid size in x")
+    p.add_argument("--tg-ny", type=int, default=32, help="Taylor-Green grid size in y")
+    p.add_argument("--tg-niter", type=int, default=1000,
+                   help="Taylor-Green: number of LBM time steps")
+    p.add_argument("--tg-dumpit", type=int, default=100,
+                   help="Taylor-Green: dump frequency (every N steps)")
+    p.add_argument("--tg-tau", type=float, default=1.0,
+                   help="Taylor-Green: BGK relaxation time (for analytic nu = (tau-0.5)*cs^2)")
+    p.add_argument("--tg-u0", type=float, default=0.01,
+                   help="Taylor-Green: initial peak velocity")
     return p.parse_args()
 
 # Animation
@@ -233,6 +246,130 @@ def make_animation(model, args):
     print(f"  GIF saved to: {gif_path}")
 
 # ──────────────────────────────────────────────
+# Taylor-Green decay with NN collision operator
+# (ported from ../model-experiments/run_all.py:simulate)
+# ──────────────────────────────────────────────
+
+def _analytic_decay(t, L, F0, nu):
+    """Analytic velocity decay for the Taylor-Green vortex."""
+    return F0 * np.exp(-2 * nu * t / (L / (2 * np.pi)) ** 2)
+
+
+def make_taylor_green_simulation(model, args):
+    """Run the Taylor-Green decay simulation using the NN as the collision operator."""
+    nx, ny = args.tg_nx, args.tg_ny
+    niter, dumpit = args.tg_niter, args.tg_dumpit
+    tau, u0 = args.tg_tau, args.tg_u0
+    Q = 9
+    cs2 = 1.0 / 3.0
+
+    print(f"\nRunning Taylor-Green simulation: {nx}x{ny}, niter={niter}, "
+          f"dumpit={dumpit}, tau={tau}, u0={u0}")
+
+    # -- Initial conditions --
+    ix, iy = np.meshgrid(range(nx), range(ny), indexing='ij')
+    x = 2.0 * np.pi * (ix / nx)
+    y = 2.0 * np.pi * (iy / ny)
+    ux  =  u0 * np.sin(x) * np.cos(y)
+    uy  = -u0 * np.cos(x) * np.sin(y)
+    rho = np.ones((nx, ny))
+
+    feq = equilibrium(rho, ux, uy)
+    f1 = np.copy(feq)
+    f2 = np.copy(feq)
+
+    # -- Data collection buffer --
+    ndumps   = int(niter // dumpit)
+    dumpfile = np.zeros((ndumps * nx * ny, 4))
+
+    def collect(t, ux, uy, rho):
+        it   = t // dumpit
+        idx0 =  it      * (nx * ny)
+        idx1 = (it + 1) * (nx * ny)
+        dumpfile[idx0:idx1, 0] = t
+        dumpfile[idx0:idx1, 1] = rho.reshape(nx * ny)
+        dumpfile[idx0:idx1, 2] = ux.reshape(nx * ny)
+        dumpfile[idx0:idx1, 3] = uy.reshape(nx * ny)
+
+    collect(0, ux, uy, rho)
+    m_initial = np.sum(f1)
+
+    # -- Time loop --
+    for t in range(1, niter):
+        # Streaming
+        for ip in range(Q):
+            f1[:, :, ip] = np.roll(np.roll(f2[:, :, ip], c[ip, 0], axis=0), c[ip, 1], axis=1)
+
+        rho = np.sum(f1, axis=2)
+        ux  = (1. / rho) * np.einsum('ijk,k', f1, c[:, 0])
+        uy  = (1. / rho) * np.einsum('ijk,k', f1, c[:, 1])
+
+        # ML collision step
+        fpre = f1.reshape((nx * ny, Q))
+        norm = np.sum(fpre, axis=1)[:, np.newaxis]
+        fpre = fpre / norm
+        f2   = model.predict(fpre, batch_size=args.batch_size, verbose=0)
+        f2   = (norm * f2).reshape((nx, ny, Q))
+
+        if t % dumpit == 0:
+            collect(t, ux, uy, rho)
+
+    m_final = np.sum(f2)
+    print(f'Sim ended. Mass err: {np.abs(m_initial - m_final) / m_initial:.2e}')
+
+    decay_plot = os.path.join(args.out_dir, "tg_velocity_decay.png")
+    fields_dir = os.path.join(args.out_dir, "tg_velocity_fields")
+    os.makedirs(fields_dir, exist_ok=True)
+    _plot_tg_results(dumpfile, niter, dumpit, nx, ny, tau, cs2, decay_plot, fields_dir)
+
+
+def _plot_tg_results(dumpfile, niter, dumpit, nx, ny, tau, cs2, decay_plot, fields_dir):
+    tLst = np.arange(0, niter, dumpit)
+    nu   = (tau - 0.5) * cs2
+    w_fig, h_fig = 3.46 * 3, 2.14 * 3
+
+    # Velocity decay
+    fig, ax = plt.subplots(figsize=(w_fig, h_fig))
+    F0 = None
+    for i, t in enumerate(tLst):
+        ux = dumpfile[dumpfile[:, 0] == t, 2]
+        uy = dumpfile[dumpfile[:, 0] == t, 3]
+        Ft = np.average((ux ** 2 + uy ** 2) ** 0.5)
+        if i == 0:
+            F0 = Ft
+            ax.semilogy(t, Ft, 'ob', label='lbm')
+        else:
+            ax.semilogy(t, Ft, 'ob')
+
+    ax.semilogy(tLst, _analytic_decay(tLst, nx, F0, nu),
+                linewidth=2.0, linestyle='--', color='r', label='analytic')
+    ax.set_xlabel(r'$t~\rm{[L.U.]}$', fontsize=16)
+    ax.set_ylabel(r'$\langle |u| \rangle$', fontsize=16, rotation=90, labelpad=0)
+    ax.legend(loc='best', frameon=False, prop={'size': 16})
+    ax.tick_params(which="both", direction="in", top="on", right="on", labelsize=14)
+    fig.savefig(decay_plot, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Decay plot -> {decay_plot}")
+
+    # Velocity field snapshots
+    X, Y = np.meshgrid(np.arange(nx), np.arange(ny))
+    for t in tLst:
+        ux = dumpfile[dumpfile[:, 0] == t, 2].reshape((nx, ny))
+        uy = dumpfile[dumpfile[:, 0] == t, 3].reshape((nx, ny))
+        u  = (ux ** 2 + uy ** 2) ** 0.5
+
+        fig, ax = plt.subplots(figsize=(w_fig, h_fig))
+        im = ax.imshow(u)
+        ax.streamplot(X, Y, ux, uy, density=0.5, color='w')
+        fig.colorbar(im, ax=ax, orientation='vertical', pad=0, shrink=0.69)
+        ax.set_title(f"Iteration {int(t)}", size=16)
+        field_path = os.path.join(fields_dir, f"velocity_field_t{int(t):05d}.png")
+        fig.savefig(field_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Field plot -> {field_path}")
+
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 
@@ -249,6 +386,11 @@ def main():
         'AlgReconstruction': AlgReconstruction,
         'D4AntiSymmetry': D4AntiSymmetry})
     model.summary()
+
+    # ── Taylor-Green mode (ported from model-experiments/run_all.py:simulate) ──
+    if args.taylor_green:
+        make_taylor_green_simulation(model, args)
+        return
 
     # ── 2. Discover data files ─────────────────────────────────────────────
     fpre_files = sorted(glob.glob(os.path.join(args.data_dir, "fpre_*.npy")))
