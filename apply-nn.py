@@ -98,6 +98,10 @@ def parse_args():
                    help="Update the GIF every N simulation steps")
     p.add_argument( "--anim-steps", type=int, default=5000,
                     help="Total number of simulation steps to run for the animation")
+    p.add_argument("--snap-every", type=int, default=1000,
+                   help="Save a PNG snapshot of the NN-driven Kármán velocity field "
+                        "every N steps during --animate (0 disables; PNGs appear on "
+                        "disk during the run, before the GIF is built)")
     p.add_argument("--taylor-green", action="store_true", default=False,
                    help="Run a Taylor-Green decay simulation with the NN as the "
                         "collision operator (skips Kármán fpre/fpost evaluation)")
@@ -162,6 +166,31 @@ def make_animation(model, args):
 
     n_steps      = args.anim_steps
     update_every = args.update_steps
+    snap_every   = args.snap_every
+
+    # -- PNG snapshot setup (written inside the loop for early visibility) --
+    U_max_snap = U_inlet * 2.0
+    snap_dir = os.path.join(args.out_dir, "karman_snapshots")
+    if snap_every > 0:
+        os.makedirs(snap_dir, exist_ok=True)
+        X_snap, Y_snap = np.meshgrid(np.arange(Nx), np.arange(Ny), indexing='ij')
+
+        def save_snapshot(step_i, ux_i, uy_i):
+            speed = np.sqrt(ux_i**2 + uy_i**2)
+            speed[obstacle] = np.nan
+            fig_s, ax_s = plt.subplots(figsize=(10, 4), dpi=100)
+            ax_s.imshow(speed.T, origin='lower', cmap='jet',
+                        vmin=0, vmax=U_max_snap, aspect='auto', extent=[0, Nx, 0, Ny])
+            ux_p = ux_i.copy();  ux_p[obstacle] = 0.0
+            uy_p = uy_i.copy();  uy_p[obstacle] = 0.0
+            ax_s.streamplot(X_snap.T, Y_snap.T, ux_p.T, uy_p.T,
+                            density=0.5, color='w', linewidth=0.6)
+            ax_s.set_title(f"NN predicted velocity — step {step_i}", fontsize=12)
+            ax_s.set_xlabel("x");  ax_s.set_ylabel("y")
+            path = os.path.join(snap_dir, f"step_{step_i:06d}.png")
+            fig_s.savefig(path, dpi=100, bbox_inches="tight")
+            plt.close(fig_s)
+            print(f"  PNG snapshot -> {path}")
 
     for step in range(1, n_steps + 1):
 
@@ -220,6 +249,10 @@ def make_animation(model, args):
             frames_uy.append(uy.copy())
             frame_steps.append(step)
             print(f"  Frame saved at step {step}/{n_steps}")
+
+        # -- Early PNG snapshot (so results are visible before GIF is built) --
+        if snap_every > 0 and step % snap_every == 0:
+            save_snapshot(step, ux, uy)
 
     # -- Build and save GIF --
     U_max = U_inlet * 2.0
