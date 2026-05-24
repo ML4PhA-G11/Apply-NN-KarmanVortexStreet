@@ -1,9 +1,10 @@
 [project]
-name = "learning-lbm-collision-operator"
+name = "applying-lbm-collision-operator"
 version = "0.1.0"
 description = "Learning Lattice Boltzmann collision operators with neural networks"
 requires-python = ">=3.10,<3.14"
 dependencies = [
+    "learning-lbm-collision-operator",
     "matplotlib>=3.10.9",
     "numba>=0.65.1",
     "numpy>=2.2.6",
@@ -19,3 +20,11 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.uv.workspace]
+members = [
+    "model-experiments",
+]
+
+[tool.uv.sources]
+learning-lbm-collision-operator = { workspace = true }

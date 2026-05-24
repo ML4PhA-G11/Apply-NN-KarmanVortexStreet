@@ -12,3 +12,4 @@ __pycache__/
 
 .claude
 artifacts-run-all-tensorflow/
+eval_results/
