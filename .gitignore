@@ -11,5 +11,6 @@ __pycache__/
 *.keras
 
 .claude
+artifacts-run-all-tensorflow
 artifacts-run-all-tensorflow/
 eval_results/
