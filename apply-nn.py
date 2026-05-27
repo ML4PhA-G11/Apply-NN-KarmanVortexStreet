@@ -94,7 +94,30 @@ def parse_args():
     p.add_argument(
         "--anim-steps", type=int, default=5000, help="Total number of simulation steps to run for the animation"
     )
+    p.add_argument(
+        "--preview-path",
+        type=str,
+        default=None,
+        help="If set, save (overwrite) a live preview PNG of the latest frame here during animation",
+    )
     return p.parse_args()
+
+
+def render_velocity_frame(ax, ux, uy, obstacle, step, U_max, Nx, Ny, X, Y):
+    ax.cla()
+    speed = np.sqrt(ux**2 + uy**2)
+    speed[obstacle] = np.nan
+    ax.imshow(speed.T, origin="lower", cmap="jet", vmin=0, vmax=U_max, aspect="auto", extent=(0, Nx, 0, Ny))
+    ux_p = ux.copy()
+    ux_p[obstacle] = 0.0
+    uy_p = uy.copy()
+    uy_p[obstacle] = 0.0
+    ax.streamplot(X.T, Y.T, ux_p.T, uy_p.T, density=0.5, color="w", linewidth=0.6)
+    ax.set_xlim(0, Nx)
+    ax.set_ylim(0, Ny)
+    ax.set_title(f"NN predicted velocity — step {step}", fontsize=12)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
 
 
 # Animation
@@ -149,6 +172,8 @@ def make_animation(model, args):
 
     n_steps = args.anim_steps
     update_every = args.update_steps
+    U_max = U_inlet * 2.0
+    X, Y = np.meshgrid(np.arange(Nx), np.arange(Ny), indexing="ij")
 
     for step in tqdm(range(1, n_steps + 1)):
 
@@ -209,37 +234,20 @@ def make_animation(model, args):
             frames_ux.append(ux.copy())
             frames_uy.append(uy.copy())
             frame_steps.append(step)
-            print(f"  Frame saved at step {step}/{n_steps}")
+            print(f"Frame appended at step {step}/{n_steps}")
+
+            if args.preview_path:
+                fig_p, ax_p = plt.subplots(figsize=(10, 4), dpi=100)
+                render_velocity_frame(ax_p, ux, uy, obstacle, f"{step}/{n_steps}", U_max, Nx, Ny, X, Y)
+                fig_p.tight_layout()
+                fig_p.savefig(args.preview_path)
+                plt.close(fig_p)
 
     # -- Build and save GIF --
-    U_max = U_inlet * 2.0
-    X, Y = np.meshgrid(np.arange(Nx), np.arange(Ny), indexing="ij")
-
     fig, ax = plt.subplots(figsize=(10, 4), dpi=100)
 
     def update(i: int) -> list[Artist]:
-        ax.cla()
-        speed = np.sqrt(frames_ux[i] ** 2 + frames_uy[i] ** 2)
-        speed[obstacle] = np.nan
-        ax.imshow(
-            speed.T,
-            origin="lower",
-            cmap="jet",
-            vmin=0,
-            vmax=U_max,
-            aspect="auto",
-            extent=(0, Nx, 0, Ny),
-        )
-        ux_i = frames_ux[i].copy()
-        ux_i[obstacle] = 0.0
-        uy_i = frames_uy[i].copy()
-        uy_i[obstacle] = 0.0
-        ax.streamplot(X.T, Y.T, ux_i.T, uy_i.T, density=0.5, color="w", linewidth=0.6)
-        ax.set_xlim(0, Nx)
-        ax.set_ylim(0, Ny)
-        ax.set_title(f"NN predicted velocity — step {frame_steps[i]}", fontsize=12)
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
+        render_velocity_frame(ax, frames_ux[i], frames_uy[i], obstacle, frame_steps[i], U_max, Nx, Ny, X, Y)
         return []
 
     anim = FuncAnimation(fig, update, frames=len(frames_ux), interval=1000 // args.gif_fps)
