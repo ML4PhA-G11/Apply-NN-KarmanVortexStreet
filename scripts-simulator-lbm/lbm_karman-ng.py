@@ -94,6 +94,7 @@ def parse_args(argv=None):
     g = p.add_argument_group("Output")
     g.add_argument("--animate", action="store_true", default=False, help="Show live matplotlib animation window")
     g.add_argument("--save-every", type=int, default=0, help="Save a snapshot image every N steps (0 = off)")
+    g.add_argument("--no-savefig", action="store_true", default=False, help="Skip saving plot images to disk (still saves .npy distributions)")
     g.add_argument("--out-dir", type=str, default="output", help="Directory for saved images")
     g.add_argument("--csv-every", type=int, default=1, help="Write forces to CSV every N steps (0 = off)")
 
@@ -146,6 +147,7 @@ def build_params(args):
         plot_mode=args.plot_mode,
         animate=args.animate,
         save_every=args.save_every,
+        no_savefig=args.no_savefig,
         out_dir=args.out_dir,
         csv_every=args.csv_every,
     )
@@ -193,6 +195,7 @@ def main(params):
     plot_mode = params["plot_mode"]
     animate = params["animate"]
     save_every = params["save_every"]
+    no_savefig = params["no_savefig"]
     out_dir = params["out_dir"]
     csv_every = params["csv_every"]
 
@@ -402,7 +405,7 @@ def main(params):
         should_render = (
             (animate and step % plot_every == 0) or (save_every > 0 and step % save_every == 0) or step == n_steps
         )
-        should_save = (save_every > 0 and step % save_every == 0) or step == n_steps
+        should_save = not no_savefig and ((save_every > 0 and step % save_every == 0) or step == n_steps)
 
         if should_render:
             plot_field(ux, uy, step, save=should_save)
