@@ -107,6 +107,11 @@ def parse_args():
     p.add_argument("--skip-evaluate", action="store_true", help="Skip snapshot evaluation and all evaluation outputs")
     p.add_argument("--skip-plot", action="store_true", help="Skip time-series metrics plot")
     p.add_argument("--skip-per-direction", action="store_true", help="Skip per-direction error plot")
+    p.add_argument(
+        "--track-positivity",
+        action="store_true",
+        help="Record per-step negative-f statistics and save to positivity_stats.csv",
+    )
     return p.parse_args()
 
 
@@ -350,7 +355,17 @@ def make_animation(model: Model, args) -> None:
 
     f = equilibrium(rho, ux, uy)
 
+    # Direction indices for bounce-back (opposite directions)
     opp = np.array([0, 3, 4, 1, 2, 7, 8, 5, 6])
+
+    # 1-cell shell around the obstacle (for positivity breakdown)
+    obstacle_adj = np.zeros_like(obstacle)
+    for shift, ax in [(1, 0), (-1, 0), (1, 1), (-1, 1)]:
+        obstacle_adj |= np.roll(obstacle, shift, axis=ax)
+    obstacle_adj &= ~obstacle
+    interior = ~obstacle & ~obstacle_adj
+
+    positivity_records: list[dict] = []
 
     frames_ux, frames_uy, frame_steps = [], [], []
     U_max = U_inlet * 2.0
@@ -363,6 +378,18 @@ def make_animation(model: Model, args) -> None:
         # NN collision with density normalization
         fpre_norm, norm = normalize(f.reshape(-1, 9))
         f_out = (model.predict(fpre_norm, batch_size=args.batch_size, verbose=cast(str, 0)) * norm).reshape(Nx, Ny, 9)
+
+        if args.track_positivity:
+            neg = f_out < 0
+            neg_vals = f_out[neg]
+            positivity_records.append({
+                "step": step,
+                "n_neg_total": int(neg.sum()),
+                "n_neg_adj": int(neg[obstacle_adj].sum()),
+                "n_neg_interior": int(neg[interior].sum()),
+                "min_f": float(neg_vals.min()) if neg_vals.size else 0.0,
+                "mean_neg_f": float(neg_vals.mean()) if neg_vals.size else 0.0,
+            })
 
         # Bounce-back on obstacle
         for i in range(9):
@@ -405,6 +432,7 @@ def make_animation(model: Model, args) -> None:
         f[0, :, 5] = f[0, :, 7] - 0.5 * (f[0, :, 2] - f[0, :, 4]) + (1.0 / 6.0) * rho_in * U_inlet
         f[0, :, 8] = f[0, :, 6] + 0.5 * (f[0, :, 2] - f[0, :, 4]) + (1.0 / 6.0) * rho_in * U_inlet
 
+        # Save frames for GIF every N steps
         if step % args.update_steps == 0:
             frames_ux.append(ux.copy())
             frames_uy.append(uy.copy())
@@ -417,6 +445,17 @@ def make_animation(model: Model, args) -> None:
                 fig_p.tight_layout()
                 fig_p.savefig(args.preview_path)
                 plt.close(fig_p)
+
+    if args.track_positivity and positivity_records:
+        csv_path = os.path.join(args.out_dir, "positivity_stats.csv")
+        keys = list(positivity_records[0].keys())
+        rows = np.array([[r[k] for k in keys] for r in positivity_records])
+        np.savetxt(csv_path, rows, delimiter=",", header=",".join(keys), comments="")
+        total_neg = int(rows[:, 1].sum())
+        first_nonzero = next((r["step"] for r in positivity_records if r["n_neg_total"] > 0), None)
+        log.info("Positivity stats saved to: %s", csv_path)
+        log.info("  Total negative-f events : %d", total_neg)
+        log.info("  First step with neg-f   : %s", first_nonzero if first_nonzero else "none")
 
     # Build and save GIF
     fig, ax = plt.subplots(figsize=(10, 4), dpi=100)
