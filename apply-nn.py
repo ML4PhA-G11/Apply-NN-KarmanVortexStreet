@@ -1,13 +1,14 @@
 """
-evaluate_nn.py
-==============
+apply-nn.py
+===========
 Evaluates the trained neural network collision operator against
-f_pre / f_post pairs saved from the Kármán vortex street simulation.
+f_pre / f_post pairs saved from the Kármán vortex street simulation,
+and optionally runs a full NN-driven LBM animation.
 
 Usage:
-    python evaluate_nn.py --model-path artifacts-run-all-tensorflow/example_network.keras \
-                          --data-dir output \
-                          --out-dir eval_results
+    python apply-nn.py --model-path artifacts-run-all-tensorflow/example_network.keras \
+                       --data-dir output \
+                       --out-dir eval_results
 
 The script expects pairs of files named:
     fpre_XXXXXX.npy   (pre-collision distribution)
@@ -16,6 +17,7 @@ The script expects pairs of files named:
 
 import os
 import glob
+import logging
 import argparse
 from typing import cast
 import numpy as np
@@ -30,7 +32,9 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 import keras
 from keras import Model, backend as K
 from numba import njit
-from lbm_ml import LB_stencil, D4Symmetry, AlgReconstruction, D4AntiSymmetry, rmsre
+from lbm_ml import LB_stencil, rmsre
+
+log = logging.getLogger(__name__)
 
 c, w, _cs2, _ = LB_stencil()
 
@@ -100,10 +104,14 @@ def parse_args():
         default=None,
         help="If set, save (overwrite) a live preview PNG of the latest frame here during animation",
     )
+    p.add_argument("--skip-evaluate", action="store_true", help="Skip snapshot evaluation and all evaluation outputs")
+    p.add_argument("--skip-plot", action="store_true", help="Skip time-series metrics plot")
+    p.add_argument("--skip-per-direction", action="store_true", help="Skip per-direction error plot")
     return p.parse_args()
 
 
 def render_velocity_frame(ax, ux, uy, obstacle, step, U_max, Nx, Ny, X, Y):
+    """Render a single velocity magnitude + streamline frame onto ax."""
     ax.cla()
     speed = np.sqrt(ux**2 + uy**2)
     speed[obstacle] = np.nan
@@ -120,254 +128,122 @@ def render_velocity_frame(ax, ux, uy, obstacle, step, U_max, Nx, Ny, X, Y):
     ax.set_ylabel("y")
 
 
-# Animation
-def make_animation(model, args):
-    """
-    Runs a full LBM simulation using the NN as the collision operator.
-    Saves a GIF frame every --update-steps steps.
-    Geometry matches lbm_karman-ng.py defaults.
-    """
-    print("\nRunning NN-driven simulation for animation ...")
-
-    # -- Simulation parameters (match lbm_karman-ng.py defaults) --
-    res = 250
-    Nx = int(round(2.2 * res))
-    Ny = int(round(0.41 * res))
-    cx_cyl = int(round(0.2 * res))
-    cy_cyl = int(round(0.2 * res))
-    r_cyl = int(round(0.05 * res))
-    U_inlet = 0.12
-    Re = 150.0
-    D = 2 * r_cyl
-    nu = U_inlet * D / Re
-    tau = 3.0 * nu + 0.5
-
-    print(f"  Grid: {Nx} x {Ny},  tau={tau:.4f},  nu={nu:.6f}")
-
-    # -- Obstacle mask --
-    x = np.arange(Nx)
-    y = np.arange(Ny)
-    X_grid, Y_grid = np.meshgrid(x, y, indexing="ij")
-    obstacle = (X_grid - cx_cyl) ** 2 + (Y_grid - cy_cyl) ** 2 <= r_cyl**2
-
-    # -- Initial conditions --
-    rho = np.ones((Nx, Ny))
-    ux = np.full((Nx, Ny), U_inlet)
-    uy = np.zeros((Nx, Ny))
-    uy += 0.001 * U_inlet * np.sin(2.0 * np.pi * Y_grid / Ny)
-    ux[obstacle] = 0.0
-    uy[obstacle] = 0.0
-    ux[:, 0] = 0.0
-    uy[:, 0] = 0.0
-    ux[:, -1] = 0.0
-    uy[:, -1] = 0.0
-
-    f = equilibrium(rho, ux, uy)
-
-    opp = np.array([0, 3, 4, 1, 2, 7, 8, 5, 6])
-
-    frames_ux = []
-    frames_uy = []
-    frame_steps = []
-
-    n_steps = args.anim_steps
-    update_every = args.update_steps
-    U_max = U_inlet * 2.0
-    X, Y = np.meshgrid(np.arange(Nx), np.arange(Ny), indexing="ij")
-
-    for step in tqdm(range(1, n_steps + 1)):
-
-        # -- Macroscopic quantities --
-        rho = np.sum(f, axis=2)
-        ux = np.sum(f * c[:, 0], axis=2) / rho
-        uy = np.sum(f * c[:, 1], axis=2) / rho
-
-        # -- NN collision --
-        fpre = f.reshape(-1, 9)
-        norm = np.sum(fpre, axis=1, keepdims=True)
-        fpre_norm = fpre / norm
-        f_out_norm = model.predict(fpre_norm, batch_size=args.batch_size, verbose=cast(str, 0))
-        f_out = (f_out_norm * norm).reshape(Nx, Ny, 9)
-
-        # -- Bounce-back on obstacle --
-        for i in range(9):
-            f_out[obstacle, i] = f[obstacle, opp[i]]
-
-        # -- Streaming --
-        for i in range(9):
-            f[:, :, i] = np.roll(f_out[:, :, i], shift=c[i, 0], axis=0)
-            f[:, :, i] = np.roll(f[:, :, i], shift=c[i, 1], axis=1)
-
-        # -- Wall bounce-back --
-        f[:, 0, 2] = f_out[:, 0, 4]
-        f[:, 0, 5] = f_out[:, 0, 7]
-        f[:, 0, 6] = f_out[:, 0, 8]
-        f[:, -1, 4] = f_out[:, -1, 2]
-        f[:, -1, 7] = f_out[:, -1, 5]
-        f[:, -1, 8] = f_out[:, -1, 6]
-
-        # -- Outlet BC (Zou-He pressure) --
-        rho_out = 1.0
-        iy = slice(1, -1)
-        ux_out = (
-            -1.0
-            + (f[-1, iy, 0] + f[-1, iy, 2] + f[-1, iy, 4] + 2.0 * (f[-1, iy, 1] + f[-1, iy, 5] + f[-1, iy, 8]))
-            / rho_out
-        )
-        ux_out = np.clip(ux_out, 0.0, 0.5)
-        f[-1, iy, 3] = f[-1, iy, 1] - (2.0 / 3.0) * rho_out * ux_out
-        f[-1, iy, 7] = f[-1, iy, 5] + 0.5 * (f[-1, iy, 2] - f[-1, iy, 4]) - (1.0 / 6.0) * rho_out * ux_out
-        f[-1, iy, 6] = f[-1, iy, 8] - 0.5 * (f[-1, iy, 2] - f[-1, iy, 4]) - (1.0 / 6.0) * rho_out * ux_out
-        for yc in [0, Ny - 1]:
-            f[-1, yc, 3] = f[-2, yc, 3]
-            f[-1, yc, 6] = f[-2, yc, 6]
-            f[-1, yc, 7] = f[-2, yc, 7]
-
-        # -- Inlet BC (Zou-He velocity) --
-        rho_in = (f[0, :, 0] + f[0, :, 2] + f[0, :, 4] + 2.0 * (f[0, :, 3] + f[0, :, 6] + f[0, :, 7])) / (1.0 - U_inlet)
-        f[0, :, 1] = f[0, :, 3] + (2.0 / 3.0) * rho_in * U_inlet
-        f[0, :, 5] = f[0, :, 7] - 0.5 * (f[0, :, 2] - f[0, :, 4]) + (1.0 / 6.0) * rho_in * U_inlet
-        f[0, :, 8] = f[0, :, 6] + 0.5 * (f[0, :, 2] - f[0, :, 4]) + (1.0 / 6.0) * rho_in * U_inlet
-
-        # -- Collect frame --
-        if step % update_every == 0:
-            frames_ux.append(ux.copy())
-            frames_uy.append(uy.copy())
-            frame_steps.append(step)
-            print(f"Frame appended at step {step}/{n_steps}")
-
-            if args.preview_path:
-                fig_p, ax_p = plt.subplots(figsize=(10, 4), dpi=100)
-                render_velocity_frame(ax_p, ux, uy, obstacle, f"{step}/{n_steps}", U_max, Nx, Ny, X, Y)
-                fig_p.tight_layout()
-                fig_p.savefig(args.preview_path)
-                plt.close(fig_p)
-
-    # -- Build and save GIF --
-    fig, ax = plt.subplots(figsize=(10, 4), dpi=100)
-
-    def update(i: int) -> list[Artist]:
-        render_velocity_frame(ax, frames_ux[i], frames_uy[i], obstacle, frame_steps[i], U_max, Nx, Ny, X, Y)
-        return []
-
-    anim = FuncAnimation(fig, update, frames=len(frames_ux), interval=1000 // args.gif_fps)
-    gif_path = os.path.join(args.out_dir, "nn_velocity_field.gif")
-    anim.save(gif_path, writer=PillowWriter(fps=args.gif_fps))
-    plt.close(fig)
-    print(f"  GIF saved to: {gif_path}")
-
-
 # ──────────────────────────────────────────────
-# Main
+# Model loading
 # ──────────────────────────────────────────────
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.out_dir, exist_ok=True)
-
-    # ── 1. Load model ──────────────────────────────────────────────────────
-    K.set_floatx("float64")
-    print(f"Loading model from: {args.model_path}")
+def load_model(model_path: str) -> Model:
+    """Load a saved Keras model with all custom objects for the NN collision operator."""
+    log.info("Loading model from: %s", model_path)
     model = cast(
         Model,
-        keras.models.load_model(
-            args.model_path,
-            custom_objects={
-                "rmsre": rmsre,
-                "D4Symmetry": D4Symmetry,
-                "AlgReconstruction": AlgReconstruction,
-                "D4AntiSymmetry": D4AntiSymmetry,
-            },
-        ),
+        keras.models.load_model(model_path, custom_objects={"rmsre": rmsre}),
     )
     model.summary()
+    return model
 
-    # ── 2. Discover data files ─────────────────────────────────────────────
-    fpre_files = sorted(glob.glob(os.path.join(args.data_dir, "fpre_*.npy")))
 
-    if len(fpre_files) == 0:
-        # The animation runs a self-contained NN-driven LBM simulation and does
-        # not need the recorded fpre/fpost snapshots. So when there is no eval
-        # data, only fail if the user actually asked for evaluation.
-        if args.animate:
-            print(
-                f"\nNo fpre_*.npy files found in '{args.data_dir}'; " "skipping evaluation and running animation only."
-            )
-            make_animation(model, args)
-            return
-        raise FileNotFoundError(
-            f"No fpre_*.npy files found in '{args.data_dir}'.\n" "Run lbm_karman-ng.py with --save-every > 0 first."
-        )
+# ──────────────────────────────────────────────
+# Snapshot evaluation
+# ──────────────────────────────────────────────
 
-    print(f"\nFound {len(fpre_files)} snapshot pair(s) in '{args.data_dir}'")
 
-    # ── 3. Evaluate each snapshot ──────────────────────────────────────────
-    steps = []
-    rmsre_scores = []
-    mae_scores = []
-    max_err = []
-
-    for fpre_path in tqdm(fpre_files):
-        # Derive matching fpost path
+def discover_snapshot_pairs(data_dir: str) -> list[tuple[int, str, str]]:
+    """Return sorted (step, fpre_path, fpost_path) tuples for all paired snapshots in data_dir."""
+    fpre_files = sorted(glob.glob(os.path.join(data_dir, "fpre_*.npy")))
+    pairs = []
+    for fpre_path in fpre_files:
         fname = os.path.basename(fpre_path)
         step_str = fname.replace("fpre_", "").replace(".npy", "")
-        fpost_path = os.path.join(args.data_dir, f"fpost_{step_str}.npy")
-
+        fpost_path = os.path.join(data_dir, f"fpost_{step_str}.npy")
         if not os.path.exists(fpost_path):
-            print(f"  [SKIP] No matching fpost for {fname}")
+            log.warning("No matching fpost for %s", fname)
             continue
+        pairs.append((int(step_str), fpre_path, fpost_path))
+    return pairs
 
-        step = int(step_str)
+
+def evaluate_snapshot(model: Model, fpre_path: str, fpost_path: str, batch_size: int) -> dict:
+    """Evaluate a single fpre/fpost pair.
+
+    Returns a dict with keys: rmsre, mae, max_err, per_dir_mean_err (shape (Q,)).
+    """
+    # Load and flatten spatial dimensions → (N_cells, 9)
+    fpre_raw = np.load(fpre_path)  # shape: (Nx, Ny, 9)
+    fpost_raw = np.load(fpost_path)  # shape: (Nx, Ny, 9)
+
+    _Nx, _Ny, Q = fpre_raw.shape
+
+    # Normalize — same as training pipeline
+    fpre_norm, _ = normalize(fpre_raw.reshape(-1, Q))  # (Nx*Ny, 9)
+    fpost_norm, _ = normalize(fpost_raw.reshape(-1, Q))
+
+    # NN prediction
+    fpost_pred = model.predict(fpre_norm, batch_size=batch_size, verbose=cast(str, 0))
+
+    # Per-snapshot metrics
+    eps = 1e-15
+    rel_err = np.abs((fpost_norm - fpost_pred) / (fpost_norm + eps))
+
+    return {
+        "rmsre": float(np.sqrt(np.mean(rel_err**2))),
+        "mae": float(np.mean(np.abs(fpost_norm - fpost_pred))),
+        "max_err": float(np.max(np.abs(fpost_norm - fpost_pred))),
+        "per_dir_mean_err": rel_err.mean(axis=0),  # (Q,)
+    }
+
+
+def run_evaluation(
+    model: Model, pairs: list[tuple[int, str, str]], batch_size: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[np.ndarray]]:
+    """Evaluate all snapshot pairs and return arrays of per-snapshot metrics.
+
+    Returns:
+        steps, rmsre_scores, mae_scores, max_err, per_dir_errors
+    """
+    steps, rmsre_scores, mae_scores, max_err, per_dir_errors = [], [], [], [], []
+
+    for step, fpre_path, fpost_path in tqdm(pairs):
+        result = evaluate_snapshot(model, fpre_path, fpost_path, batch_size)
         steps.append(step)
+        rmsre_scores.append(result["rmsre"])
+        mae_scores.append(result["mae"])
+        max_err.append(result["max_err"])
+        per_dir_errors.append(result["per_dir_mean_err"])
+        log.info(
+            "Step %6d | RMSRE=%.4e  MAE=%.4e  MaxErr=%.4e", step, result["rmsre"], result["mae"], result["max_err"]
+        )
 
-        # Load and flatten spatial dimensions → (N_cells, 9)
-        fpre_raw = np.load(fpre_path)  # shape: (Nx, Ny, 9)
-        fpost_raw = np.load(fpost_path)  # shape: (Nx, Ny, 9)
+    return (
+        np.array(steps),
+        np.array(rmsre_scores),
+        np.array(mae_scores),
+        np.array(max_err),
+        per_dir_errors,
+    )
 
-        Nx, Ny, Q = fpre_raw.shape
-        fpre_flat = fpre_raw.reshape(-1, Q)  # (Nx*Ny, 9)
-        fpost_flat = fpost_raw.reshape(-1, Q)
 
-        # Normalize — same as training pipeline
-        fpre_norm, norm = normalize(fpre_flat)
-        fpost_norm, _ = normalize(fpost_flat)
+# ──────────────────────────────────────────────
+# Saving and plotting
+# ──────────────────────────────────────────────
 
-        # NN prediction
-        fpost_pred_norm = model.predict(fpre_norm, batch_size=args.batch_size, verbose=cast(str, 0))
 
-        # ── Per-snapshot metrics ───────────────────────────────────────────
-        eps = 1e-15
+def save_metrics_csv(steps, rmsre_scores, mae_scores, max_err, out_dir: str) -> None:
+    """Save per-snapshot evaluation metrics to CSV."""
+    csv_path = os.path.join(out_dir, "eval_metrics.csv")
+    np.savetxt(
+        csv_path,
+        np.column_stack([steps, rmsre_scores, mae_scores, max_err]),
+        delimiter=",",
+        header="step,rmsre,mae,max_abs_error",
+        comments="",
+    )
+    log.info("Metrics saved to: %s", csv_path)
 
-        # RMSRE
-        rel_sq = ((fpost_norm - fpost_pred_norm) / (fpost_norm + eps)) ** 2
-        rmsre_val = np.sqrt(np.mean(rel_sq))
 
-        # MAE
-        mae_val = np.mean(np.abs(fpost_norm - fpost_pred_norm))
-
-        # Max absolute error
-        max_val = np.max(np.abs(fpost_norm - fpost_pred_norm))
-
-        rmsre_scores.append(rmsre_val)
-        mae_scores.append(mae_val)
-        max_err.append(max_val)
-
-        print(f"  Step {step:>6d} | RMSRE={rmsre_val:.4e}  MAE={mae_val:.4e}  MaxErr={max_val:.4e}")
-
-    steps = np.array(steps)
-    rmsre_scores = np.array(rmsre_scores)
-    mae_scores = np.array(mae_scores)
-    max_err = np.array(max_err)
-
-    # ── 4. Save metrics to CSV ─────────────────────────────────────────────
-    csv_path = os.path.join(args.out_dir, "eval_metrics.csv")
-    header = "step,rmsre,mae,max_abs_error"
-    data = np.column_stack([steps, rmsre_scores, mae_scores, max_err])
-    np.savetxt(csv_path, data, delimiter=",", header=header, comments="")
-    print(f"\nMetrics saved to: {csv_path}")
-
-    # ── 5. Plot metrics over simulation time ───────────────────────────────
+def plot_metrics(steps, rmsre_scores, mae_scores, max_err, out_dir: str) -> None:
+    """Plot RMSRE, MAE, and max absolute error over simulation time."""
     fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
 
     axes[0].semilogy(steps, rmsre_scores, "o-", color="steelblue", lw=1.5, ms=4)
@@ -385,35 +261,26 @@ def main():
     axes[2].grid(True, alpha=0.3)
 
     fig.tight_layout()
-    plot_path = os.path.join(args.out_dir, "eval_metrics.png")
+    plot_path = os.path.join(out_dir, "eval_metrics.png")
     fig.savefig(plot_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
-    print(f"Plot saved to:    {plot_path}")
+    log.info("Plot saved to: %s", plot_path)
 
-    # ── 6. Distribution plot — best vs worst snapshot ─────────────────────
-    # Reload best and worst snapshots for a per-direction error breakdown
-    best_idx = np.argmin(rmsre_scores)
-    worst_idx = np.argmax(rmsre_scores)
 
+def plot_per_direction_errors(
+    per_dir_errors: list[np.ndarray],
+    rmsre_scores: np.ndarray,
+    steps: np.ndarray,
+    best_idx: int,
+    worst_idx: int,
+    out_dir: str,
+) -> None:
+    """Plot mean relative error per velocity direction for the best and worst snapshots."""
+    Q = len(per_dir_errors[0])
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
     for ax, idx, label in zip(axes, [best_idx, worst_idx], ["Best snapshot", "Worst snapshot"]):
-        step_str = f"{steps[idx]:06d}"
-        fpre_raw = np.load(os.path.join(args.data_dir, f"fpre_{step_str}.npy"))
-        fpost_raw = np.load(os.path.join(args.data_dir, f"fpost_{step_str}.npy"))
-
-        Nx, Ny, Q = fpre_raw.shape
-        fpre_norm, _ = normalize(fpre_raw.reshape(-1, Q))
-        fpost_norm, _ = normalize(fpost_raw.reshape(-1, Q))
-
-        fpost_pred = model.predict(fpre_norm, batch_size=args.batch_size, verbose=cast(str, 0))
-
-        eps = 1e-15
-        rel_err = np.abs((fpost_norm - fpost_pred) / (fpost_norm + eps))
-
-        # Mean relative error per velocity direction
-        mean_per_dir = rel_err.mean(axis=0)
-        ax.bar(range(Q), mean_per_dir, color="steelblue", edgecolor="k", linewidth=0.5)
+        ax.bar(range(Q), per_dir_errors[idx], color="steelblue", edgecolor="k", linewidth=0.5)
         ax.set_xticks(range(Q))
         ax.set_xticklabels([f"f{i}" for i in range(Q)])
         ax.set_ylabel("Mean relative error")
@@ -421,20 +288,184 @@ def main():
         ax.grid(True, axis="y", alpha=0.3)
 
     fig.tight_layout()
-    dist_path = os.path.join(args.out_dir, "per_direction_error.png")
+    dist_path = os.path.join(out_dir, "per_direction_error.png")
     fig.savefig(dist_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
-    print(f"Per-direction plot: {dist_path}")
+    log.info("Per-direction plot: %s", dist_path)
 
-    # ── 7. Summary ─────────────────────────────────────────────────────────
-    print("\n── Summary ───────────────────────────────────────")
-    print(f"  Snapshots evaluated : {len(steps)}")
-    print(
-        f"  RMSRE  — mean: {rmsre_scores.mean():.4e}  " f"min: {rmsre_scores.min():.4e}  max: {rmsre_scores.max():.4e}"
-    )
-    print(f"  MAE    — mean: {mae_scores.mean():.4e}  " f"min: {mae_scores.min():.4e}  max: {mae_scores.max():.4e}")
-    print(f"  MaxErr — mean: {max_err.mean():.4e}  " f"min: {max_err.min():.4e}  max: {max_err.max():.4e}")
-    print("──────────────────────────────────────────────────\n")
+
+def print_summary(steps, rmsre_scores, mae_scores, max_err) -> None:
+    """Log aggregate evaluation metrics."""
+    log.info("── Summary ───────────────────────────────────────")
+    log.info("  Snapshots evaluated : %d", len(steps))
+    log.info("  RMSRE  — mean: %.4e  min: %.4e  max: %.4e", rmsre_scores.mean(), rmsre_scores.min(), rmsre_scores.max())
+    log.info("  MAE    — mean: %.4e  min: %.4e  max: %.4e", mae_scores.mean(), mae_scores.min(), mae_scores.max())
+    log.info("  MaxErr — mean: %.4e  min: %.4e  max: %.4e", max_err.mean(), max_err.min(), max_err.max())
+    log.info("──────────────────────────────────────────────────")
+
+
+# ──────────────────────────────────────────────
+# Animation
+# ──────────────────────────────────────────────
+
+
+def make_animation(model: Model, args) -> None:
+    """
+    Run a full LBM simulation using the NN as the collision operator.
+    Saves a GIF frame every --update-steps steps.
+    Geometry matches lbm_karman-ng.py defaults.
+    """
+
+    log.info("Running NN-driven simulation for animation ...")
+
+    # Simulation parameters (match lbm_karman-ng.py defaults)
+    res = 250
+    Nx = int(round(2.2 * res))
+    Ny = int(round(0.41 * res))
+    cx_cyl = int(round(0.2 * res))
+    cy_cyl = int(round(0.2 * res))
+    r_cyl = int(round(0.05 * res))
+    U_inlet = 0.12
+    Re = 150.0
+    D = 2 * r_cyl
+    nu = U_inlet * D / Re
+    tau = 3.0 * nu + 0.5
+
+    log.info("Grid: %d x %d,  tau=%.4f,  nu=%.6f", Nx, Ny, tau, nu)
+
+    # Obstacle mask
+    x = np.arange(Nx)
+    y = np.arange(Ny)
+    X_grid, Y_grid = np.meshgrid(x, y, indexing="ij")
+    obstacle = (X_grid - cx_cyl) ** 2 + (Y_grid - cy_cyl) ** 2 <= r_cyl**2
+
+    # Initial conditions
+    rho = np.ones((Nx, Ny))
+    ux = np.full((Nx, Ny), U_inlet)
+    uy = 0.001 * U_inlet * np.sin(2.0 * np.pi * Y_grid / Ny)
+    for arr in (ux, uy):
+        arr[obstacle] = 0.0
+        arr[:, 0] = 0.0
+        arr[:, -1] = 0.0
+
+    f = equilibrium(rho, ux, uy)
+
+    opp = np.array([0, 3, 4, 1, 2, 7, 8, 5, 6])
+
+    frames_ux, frames_uy, frame_steps = [], [], []
+    U_max = U_inlet * 2.0
+    X, Y = np.meshgrid(np.arange(Nx), np.arange(Ny), indexing="ij")
+
+    for step in tqdm(range(1, args.anim_steps + 1)):
+        # Macroscopic quantities
+        ux, uy, rho = f_to_velocity(f.reshape(-1, 9), Nx, Ny)
+
+        # NN collision with density normalization
+        fpre_norm, norm = normalize(f.reshape(-1, 9))
+        f_out = (model.predict(fpre_norm, batch_size=args.batch_size, verbose=cast(str, 0)) * norm).reshape(Nx, Ny, 9)
+
+        # Bounce-back on obstacle
+        for i in range(9):
+            f_out[obstacle, i] = f[obstacle, opp[i]]
+
+        # Streaming
+        for i in range(9):
+            f[:, :, i] = np.roll(f_out[:, :, i], shift=c[i, 0], axis=0)
+            f[:, :, i] = np.roll(f[:, :, i], shift=c[i, 1], axis=1)
+
+        # Wall bounce-back
+        f[:, 0, 2] = f_out[:, 0, 4]
+        f[:, 0, 5] = f_out[:, 0, 7]
+        f[:, 0, 6] = f_out[:, 0, 8]
+        f[:, -1, 4] = f_out[:, -1, 2]
+        f[:, -1, 7] = f_out[:, -1, 5]
+        f[:, -1, 8] = f_out[:, -1, 6]
+
+        # Outlet BC (Zou-He pressure)
+        rho_out = 1.0
+        iy = slice(1, -1)
+        ux_out = np.clip(
+            -1.0
+            + (f[-1, iy, 0] + f[-1, iy, 2] + f[-1, iy, 4] + 2.0 * (f[-1, iy, 1] + f[-1, iy, 5] + f[-1, iy, 8]))
+            / rho_out,
+            0.0,
+            0.5,
+        )
+        f[-1, iy, 3] = f[-1, iy, 1] - (2.0 / 3.0) * rho_out * ux_out
+        f[-1, iy, 7] = f[-1, iy, 5] + 0.5 * (f[-1, iy, 2] - f[-1, iy, 4]) - (1.0 / 6.0) * rho_out * ux_out
+        f[-1, iy, 6] = f[-1, iy, 8] - 0.5 * (f[-1, iy, 2] - f[-1, iy, 4]) - (1.0 / 6.0) * rho_out * ux_out
+        for yc in [0, Ny - 1]:
+            f[-1, yc, 3] = f[-2, yc, 3]
+            f[-1, yc, 6] = f[-2, yc, 6]
+            f[-1, yc, 7] = f[-2, yc, 7]
+
+        # Inlet BC (Zou-He velocity)
+        rho_in = (f[0, :, 0] + f[0, :, 2] + f[0, :, 4] + 2.0 * (f[0, :, 3] + f[0, :, 6] + f[0, :, 7])) / (1.0 - U_inlet)
+        f[0, :, 1] = f[0, :, 3] + (2.0 / 3.0) * rho_in * U_inlet
+        f[0, :, 5] = f[0, :, 7] - 0.5 * (f[0, :, 2] - f[0, :, 4]) + (1.0 / 6.0) * rho_in * U_inlet
+        f[0, :, 8] = f[0, :, 6] + 0.5 * (f[0, :, 2] - f[0, :, 4]) + (1.0 / 6.0) * rho_in * U_inlet
+
+        if step % args.update_steps == 0:
+            frames_ux.append(ux.copy())
+            frames_uy.append(uy.copy())
+            frame_steps.append(step)
+            log.info("Frame appended at step %d/%d", step, args.anim_steps)
+
+            if args.preview_path:
+                fig_p, ax_p = plt.subplots(figsize=(10, 4), dpi=100)
+                render_velocity_frame(ax_p, ux, uy, obstacle, f"{step}/{args.anim_steps}", U_max, Nx, Ny, X, Y)
+                fig_p.tight_layout()
+                fig_p.savefig(args.preview_path)
+                plt.close(fig_p)
+
+    # Build and save GIF
+    fig, ax = plt.subplots(figsize=(10, 4), dpi=100)
+
+    def update(i: int) -> list[Artist]:
+        render_velocity_frame(ax, frames_ux[i], frames_uy[i], obstacle, frame_steps[i], U_max, Nx, Ny, X, Y)
+        return []
+
+    anim = FuncAnimation(fig, update, frames=len(frames_ux), interval=1000 // args.gif_fps)
+    gif_path = os.path.join(args.out_dir, "nn_velocity_field.gif")
+    anim.save(gif_path, writer=PillowWriter(fps=args.gif_fps))
+    plt.close(fig)
+    log.info("GIF saved to: %s", gif_path)
+
+
+# ──────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    args = parse_args()
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # Load model
+    K.set_floatx("float64")
+    model = load_model(args.model_path)
+
+    if not args.skip_evaluate:
+        pairs = discover_snapshot_pairs(args.data_dir)
+        if not pairs:
+            if not args.animate:
+                raise FileNotFoundError(
+                    f"No fpre_*.npy files found in '{args.data_dir}'.\n"
+                    "Run lbm_karman-ng.py with --save-every > 0 first."
+                )
+            log.info("No fpre/fpost pairs found in '%s'; skipping evaluation.", args.data_dir)
+        else:
+            log.info("Found %d snapshot pair(s) in '%s'", len(pairs), args.data_dir)
+            steps, rmsre_scores, mae_scores, max_err, per_dir_errors = run_evaluation(model, pairs, args.batch_size)
+            save_metrics_csv(steps, rmsre_scores, mae_scores, max_err, args.out_dir)
+            if not args.skip_plot:
+                plot_metrics(steps, rmsre_scores, mae_scores, max_err, args.out_dir)
+            if not args.skip_per_direction:
+                best_idx = int(np.argmin(rmsre_scores))
+                worst_idx = int(np.argmax(rmsre_scores))
+                plot_per_direction_errors(per_dir_errors, rmsre_scores, steps, best_idx, worst_idx, args.out_dir)
+            print_summary(steps, rmsre_scores, mae_scores, max_err)
 
     if args.animate:
         make_animation(model, args)
